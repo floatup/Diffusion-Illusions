@@ -7,6 +7,20 @@ import rp
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
+def _clip_normalize_image(image: torch.Tensor) -> torch.Tensor:
+    assert isinstance(image, torch.Tensor), "image should be a torch.Tensor"
+    assert image.ndim == 3, "image should be in CHW form"
+    assert image.shape[0] == 3, "image should be rgb"
+    assert image.min() >= 0 and image.max() <= 1, "image should have values between 0 and 1"
+
+    mean = torch.tensor(clip_processor.feature_extractor.image_mean).to(image.device)
+    std = torch.tensor(clip_processor.feature_extractor.image_std).to(image.device)
+
+    norm_image = rp.torch_resize_image(image, (224, 224))
+    norm_image = norm_image[None]
+    norm_image = (norm_image - mean[None, :, None, None]) / std[None, :, None, None]
+    return norm_image
+
 def get_clip_logits(image: Union[torch.Tensor, np.ndarray], prompts: Union[List[str], str]) -> Union[torch.Tensor, np.ndarray]:
     """
     Takes a torch image and a list of prompt strings and returns a vector of log-likelihoods.
@@ -56,14 +70,8 @@ def get_clip_logits(image: Union[torch.Tensor, np.ndarray], prompts: Union[List[
     inputs = clip_processor(text=list(prompts), images=image_hwc.detach().cpu(), return_tensors="pt", padding=True)
 
     #There is a specific mean and std this clip_model expects
-    mean = torch.tensor(clip_processor.feature_extractor.image_mean).to(image.device) # [0.4815, 0.4578, 0.4082]
-    std  = torch.tensor(clip_processor.feature_extractor.image_std ).to(image.device) # [0.2686, 0.2613, 0.2758]
-
     #Normalize the image the way the clip_processor does
-    norm_image = image # (3,H,W)
-    norm_image = rp.torch_resize_image(norm_image,(224,224)) # (3,224,224)
-    norm_image = norm_image[None] # (1,3,224,224)
-    norm_image = (norm_image - mean[None, :, None, None]) / std[None, :, None, None]
+    norm_image = _clip_normalize_image(image)
     norm_image = norm_image.type_as(inputs["pixel_values"])
     inputs["pixel_values"] = norm_image
     
@@ -82,3 +90,42 @@ def get_clip_logits(image: Union[torch.Tensor, np.ndarray], prompts: Union[List[
     assert output.shape == (len(prompts),)
     
     return output
+
+def get_clip_image_similarity(
+    image: Union[torch.Tensor, np.ndarray],
+    prompt_image: Union[torch.Tensor, np.ndarray],
+) -> Union[torch.Tensor, np.ndarray]:
+    """
+    Returns cosine similarity between two images in CLIP image-embedding space.
+    The gradients can be propagated back into the first image.
+    """
+    if rp.is_image(image):
+        device = "cuda"
+        image = rp.as_rgb_image(image)
+        image = rp.as_float_image(image)
+        image = rp.as_torch_image(image).to(device)
+        output = get_clip_image_similarity(image, prompt_image)
+        return rp.as_numpy_array(output)
+
+    assert isinstance(image, torch.Tensor), "image should be a torch.Tensor"
+    assert image.ndim == 3, "image should be in CHW form"
+
+    if rp.is_image(prompt_image):
+        prompt_image = rp.as_rgb_image(prompt_image)
+        prompt_image = rp.as_float_image(prompt_image)
+        prompt_image = rp.as_torch_image(prompt_image).to(image.device)
+    assert isinstance(prompt_image, torch.Tensor), "prompt_image should be a torch.Tensor"
+    assert prompt_image.ndim == 3, "prompt_image should be in CHW form"
+
+    image_inputs = _clip_normalize_image(image)
+    prompt_inputs = _clip_normalize_image(prompt_image.detach())
+
+    image_features = clip_model.to(image.device).get_image_features(pixel_values=image_inputs)
+    prompt_features = clip_model.to(image.device).get_image_features(pixel_values=prompt_inputs)
+
+    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+    prompt_features = prompt_features / prompt_features.norm(dim=-1, keepdim=True)
+
+    similarity = (image_features * prompt_features).sum(dim=-1)
+    assert similarity.shape == (1,)
+    return similarity[0]

@@ -341,6 +341,7 @@ def make_image_square(image:np.ndarray, method='crop')->np.ndarray:
                     
 
 def run_peekaboo(name:str, image:Union[str,np.ndarray], label:Optional['BaseLabel']=None,
+                prompt_image:Optional[Union[str,np.ndarray]]=None,
                 
                 #Peekaboo Hyperparameters:
                 GRAVITY=1e-1/2, # This is the one that needs the most tuning, depending on the prompt...
@@ -378,6 +379,17 @@ def run_peekaboo(name:str, image:Union[str,np.ndarray], label:Optional['BaseLabe
     image=rp.as_rgb_image(rp.as_float_image(make_image_square(image,square_image_method)))
     rp.tic()
     time_started=rp.get_current_date()
+
+    prompt_image_path = '<No prompt image path given>'
+    prompt_image_torch = None
+    prompt_image_np = None
+    if prompt_image is not None:
+        if isinstance(prompt_image, str):
+            prompt_image_path = prompt_image
+            prompt_image = rp.load_image(prompt_image)
+        assert rp.is_image(prompt_image)
+        prompt_image_np = rp.as_rgb_image(rp.as_float_image(prompt_image))
+        prompt_image_torch = rp.as_torch_image(prompt_image_np).to(s.device)
     
     
     log_cell('Get Hyperparameters') ########################################################################
@@ -437,12 +449,19 @@ def run_peekaboo(name:str, image:Union[str,np.ndarray], label:Optional['BaseLabe
                 for label, composite in zip(p.labels, composites):
                     if clip_coef>0: 
                         #Use clip instead of stable-dream-loss
-                        #You must use 'name' for the prompt in this case
-                        from .clip import get_clip_logits
-                        logit=get_clip_logits(composite, label.name)*clip_coef
-                        loss=-logit
-                        loss.sum().backward(retain_graph=True)
-                        print(float(loss.sum()))
+                        if prompt_image_torch is not None:
+                            from .clip import get_clip_image_similarity
+                            sim=get_clip_image_similarity(composite, prompt_image_torch)*clip_coef
+                            loss=-sim
+                            loss.backward(retain_graph=True)
+                            print(float(loss))
+                        else:
+                            #You must use 'name' for the prompt in this case
+                            from .clip import get_clip_logits
+                            logit=get_clip_logits(composite, label.name)*clip_coef
+                            loss=-logit
+                            loss.sum().backward(retain_graph=True)
+                            print(float(loss.sum()))
                     if use_stable_dream_loss:
                         s.train_step(label.embedding, composite[None], 
                                      guidance_scale=GUIDANCE_SCALE
@@ -488,6 +507,8 @@ def run_peekaboo(name:str, image:Union[str,np.ndarray], label:Optional['BaseLabe
         image=image,
         image_path=image_path,
         clip_coef=clip_coef,
+        prompt_image_path=prompt_image_path,
+        **({'prompt_image':prompt_image_np} if prompt_image_np is not None else {}),
         
         use_stable_dream_loss=use_stable_dream_loss,
         #Record some extra info
